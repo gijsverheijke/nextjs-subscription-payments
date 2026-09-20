@@ -4,6 +4,7 @@ import Stripe from 'stripe';
 import { stripe } from '@/utils/stripe/config';
 import { createClient } from '@/utils/supabase/server';
 import { createOrRetrieveCustomer } from '@/utils/supabase/admin';
+import { captureServerEvent } from '@/utils/posthog/server';
 import {
   getURL,
   getErrorRedirect,
@@ -64,6 +65,8 @@ export async function checkoutWithStripe(
       success_url: getURL(redirectPath)
     };
 
+    const checkoutType = price.type === 'recurring' ? 'subscription' : 'topup';
+
     console.log(
       'Trial end:',
       calculateTrialEndUnixTimestamp(price.trial_period_days)
@@ -89,11 +92,23 @@ export async function checkoutWithStripe(
       session = await stripe.checkout.sessions.create(params);
     } catch (err) {
       console.error(err);
+      // Record the failed creation attempt so it is visible in analytics.
+      // No transaction or customer identifiers are attached.
+      await captureServerEvent(user.id, 'checkout_creation_failed', {
+        checkout_type: checkoutType,
+        price_id: price.id,
+        error_message: err instanceof Error ? err.message : 'unknown_error'
+      });
       throw new Error('Unable to create checkout session.');
     }
 
     // Instead of returning a Response, just return the data or error.
     if (session) {
+      await captureServerEvent(user.id, `${checkoutType}_checkout_started`, {
+        checkout_type: checkoutType,
+        price_id: price.id,
+        stripe_checkout_session_id: session.id
+      });
       return { sessionId: session.id };
     } else {
       throw new Error('Unable to create checkout session.');
